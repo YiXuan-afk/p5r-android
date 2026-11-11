@@ -231,7 +231,9 @@ bool guess_planar(const std::string& name) {
 // The codec's picture (color format `color`, rows of `stride` bytes, `rows` rows per plane) into tight NV12 of the
 // video's size, from the crop origin. I420 is interleaved; every other format is taken as semi-planar (NV12 and the
 // Qualcomm/MediaTek variants with aligned strides, which is what ByteBuffer decoders hand out).
-void to_nv12(Decoder& d, const uint8_t* src, size_t size, std::vector<uint8_t>& out) {
+// `size` is the picture's byte count from the codec (info.size); `avail` is how many bytes from `src` the codec's
+// buffer really holds (at least `size`): the planes' own offsets decide what is read, so they are bound by `avail`.
+void to_nv12(Decoder& d, const uint8_t* src, size_t size, size_t avail, std::vector<uint8_t>& out) {
     const int32_t w = d.width, h = d.height;
     int32_t stride = d.codec_stride > 0 ? d.codec_stride : w, rows = d.codec_rows > 0 ? d.codec_rows : h;
     if (d.color == kColorQcom32m && d.codec_stride <= 0) stride = (w + 127) & ~127, rows = (h + 31) & ~31;
@@ -278,6 +280,7 @@ void to_nv12(Decoder& d, const uint8_t* src, size_t size, std::vector<uint8_t>& 
     out.resize(size_t(w) * h * 3 / 2);
     diag::movie_frame_alloc(out.size(), out.capacity());
     if (d.has_planes && d.plane_row[0] > 0 && d.plane_row[1] > 0 && d.plane_row[2] > 0) {
+        const size_t size = avail;  // (shadows the parameter on purpose: every bound below is the buffer's)
         const size_t y_stride = d.plane_row[0];
         const size_t y_off = d.plane_off[0] + size_t(d.crop_top) * y_stride + size_t(d.crop_left);
         for (int32_t r = 0; r < h; r++) {
@@ -299,14 +302,19 @@ void to_nv12(Decoder& d, const uint8_t* src, size_t size, std::vector<uint8_t>& 
             }
             return;
         }
+        // Planar (I420/YV12) or any other arrangement of the two chroma planes: interleave into NV12's UV rows. The
+        // row's last sample is checked once, not every pixel.
+        const size_t half = size_t(w / 2);
         for (int32_t r = 0; r < h / 2; r++) {
-            size_t u_at = u_off + size_t(r) * u_stride;
-            size_t v_at = v_off + size_t(r) * v_stride;
-            for (int32_t x = 0; x < w / 2; x++) {
-                size_t ui = u_at + size_t(x) * u_step, vi = v_at + size_t(x) * v_step;
-                if (ui >= size || vi >= size) return;
-                uv[size_t(r) * w + 2 * x] = src[ui];
-                uv[size_t(r) * w + 2 * x + 1] = src[vi];
+            const size_t u_at = u_off + size_t(r) * u_stride;
+            const size_t v_at = v_off + size_t(r) * v_stride;
+            if (half == 0 || u_at + (half - 1) * u_step >= size || v_at + (half - 1) * v_step >= size) return;
+            const uint8_t* up = src + u_at;
+            const uint8_t* vp = src + v_at;
+            uint8_t* dst = uv + size_t(r) * w;
+            for (size_t x = 0; x < half; x++) {
+                dst[2 * x] = up[x * u_step];
+                dst[2 * x + 1] = vp[x * v_step];
             }
         }
         return;
@@ -349,17 +357,46 @@ void read_codec_format(Decoder& d) {
     d.has_planes = false;
     void* img_data = nullptr;
     size_t img_size = 0;
-    if (AMediaFormat_getBuffer(f, "image-data", &img_data, &img_size) && img_data && img_size >= 80) {
-        const auto* u = static_cast<const uint32_t*>(img_data);
-        if (u[0] == 1 && u[1] >= 3) {  // MediaImage2::TYPE_YUV (1), 3 planes (Y, U, V)
+    // MediaImage2 (media/hardware/VideoAPI.h), as 32-bit words: [0] type (1: YUV), [1] number of planes, [2] width,
+    // [3] height, [4] bit depth, [5] bit depth allocated; then 4 planes of 5 words each from [6]: offset, column
+    // increment (bytes between two samples of the row), row increment (the stride), horizontal and vertical
+    // subsampling. (An earlier version started at word 8 with 4 words per plane: it read the stride of the luma
+    // plane as 1, which sheared the picture into diagonal stripes and put the chroma in the wrong place.)
+    if (AMediaFormat_getBuffer(f, "image-data", &img_data, &img_size) && img_data && img_size >= (6 + 3 * 5) * 4) {
+        uint32_t mi[26] = {};
+        std::memcpy(mi, img_data, std::min(img_size, sizeof mi));
+        auto word = [&](int p, int k) { return mi[6 + p * 5 + k]; };
+        const char* why = nullptr;
+        if (mi[0] != 1 || mi[1] < 3) {
+            why = "not a 3-plane YUV image";
+        } else if (mi[4] > 8 || mi[5] > 8) {
+            why = "more than 8 bits per sample";
+        } else {
+            for (int p = 0; p < 3 && !why; p++) {
+                const int32_t col = int32_t(word(p, 1)), row = int32_t(word(p, 2));
+                const int64_t pw = p == 0 ? d.width : d.width / 2;
+                if (col < 1 || row < 1) why = "non-positive increments";
+                else if (p == 0 && col != 1) why = "luma samples not contiguous";
+                else if (p > 0 && (col > 2 || word(p, 3) != 2 || word(p, 4) != 2)) why = "chroma is not 4:2:0";
+                else if (int64_t(row) < (pw - 1) * col + 1) why = "row increment smaller than the picture's width";
+            }
+        }
+        log("movie: image-data: type %u, %u planes, bit depth %u/%u; plane (offset, col inc, row inc, h/v subsampling): "
+            "Y %u,%d,%d,%u/%u  U %u,%d,%d,%u/%u  V %u,%d,%d,%u/%u", mi[0], mi[1], mi[4], mi[5], word(0, 0),
+            int32_t(word(0, 1)), int32_t(word(0, 2)), word(0, 3), word(0, 4), word(1, 0), int32_t(word(1, 1)),
+            int32_t(word(1, 2)), word(1, 3), word(1, 4), word(2, 0), int32_t(word(2, 1)), int32_t(word(2, 2)),
+            word(2, 3), word(2, 4));
+        if (why) {
+            log("movie: image-data not used (%s): the reported stride and slice height are taken instead", why);
+        } else {
             for (int p = 0; p < 3; p++) {
-                d.plane_off[p] = u[8 + p * 4 + 0];
-                d.plane_col[p] = u[8 + p * 4 + 1];
-                d.plane_row[p] = u[8 + p * 4 + 2];
+                d.plane_off[p] = word(p, 0);
+                d.plane_col[p] = word(p, 1);
+                d.plane_row[p] = word(p, 2);
             }
             d.has_planes = true;
             d.is_planar = (d.plane_col[1] == 1);
-            if (d.plane_row[0] > 0) d.codec_stride = int32_t(d.plane_row[0]);
+            d.codec_stride = int32_t(d.plane_row[0]);
         }
     }
 
@@ -414,7 +451,9 @@ bool pump(Decoder& d, int64_t wait_us) {
         uint8_t* buf = AMediaCodec_getOutputBuffer(d.codec, size_t(o), &size);
         const uint64_t t0 = plat::monotonic_ns();
         if (buf && info.size > 0) {
-            to_nv12(d, buf + info.offset, size_t(info.size), d.frames[slot]);
+            const size_t avail = size > size_t(info.offset) ? std::max(size_t(info.size), size - size_t(info.offset))
+                                                            : size_t(info.size);
+            to_nv12(d, buf + info.offset, size_t(info.size), avail, d.frames[slot]);
             const uint64_t t1 = plat::monotonic_ns();
             d.win.convert_ns += t1 - t0;
             diag::movie_convert(t1 - t0, t1);
